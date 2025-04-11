@@ -9,8 +9,9 @@ from typing import Dict, Any, List
 import asyncio
 from sqlalchemy.orm import Session # For type hinting
 
-# Import the available tools (functions) and the lookup dictionary
-from .tools import AVAILABLE_TOOLS, get_tool_definitions, _error_response
+# Import the function map, tool definition getter, and error helper
+# AVAILABLE_TOOLS is renamed to AVAILABLE_FUNCTIONS in tools.py now
+from .tools import AVAILABLE_FUNCTIONS, get_tool_definitions, _error_response
 # Import DB session factory
 from ..persistence import database
 
@@ -30,12 +31,12 @@ genai.configure(api_key=GEMINI_API_KEY)
 # Use a model that supports function calling, like Gemini 1.5 Pro
 MODEL_NAME = "gemini-1.5-pro-latest" # Or specific version
 
-# Instantiate the generative model
-# Pass the defined Python functions directly to the model's 'tools' parameter.
-# The genai library automatically converts them into the required format.
+# Instantiate the generative model WITHOUT tools due to schema generation errors
+# TODO: Re-enable tools=[get_tool_definitions()] when library issues are resolved or schema is fixed.
+logging.warning("Initializing Gemini Model WITHOUT tools due to schema generation errors.")
 model = genai.GenerativeModel(
-    MODEL_NAME,
-    tools=get_tool_definitions() # Pass the list of function objects
+    MODEL_NAME
+    # tools=get_tool_definitions() # Temporarily disabled
 )
 
 # --- Interaction Logic ---
@@ -80,9 +81,10 @@ async def process_natural_language_request(user_prompt: str) -> Dict[str, Any]:
             logging.info(f"Gemini requested function call: {tool_name} with args: {tool_args}")
 
             # --- Security Check & Tool Availability ---
-            if tool_name not in AVAILABLE_TOOLS:
-                logging.error(f"Gemini requested an unavailable/unknown tool: {tool_name}")
-                # Send error back to Gemini so it knows the tool failed
+            # This check is now less relevant as tools are disabled at model init,
+            # but keep for defensive programming if tools are re-enabled later.
+            if tool_name not in AVAILABLE_FUNCTIONS:
+                logging.error(f"Gemini requested a non-existent tool function: {tool_name}")
                 error_response_part = genai.Part.from_function_response(
                     name=tool_name,
                     response={"error": f"Tool '{tool_name}' is not available or not recognized."}

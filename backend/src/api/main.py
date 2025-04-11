@@ -1,46 +1,38 @@
 import logging
+import time # For agent detail consistency check
 from fastapi import FastAPI, HTTPException, Body, Query, Depends, status
 from fastapi.security import OAuth2PasswordBearer # Example for Auth
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 from typing import List, Dict, Any, Optional, Literal
 
 # Configure basic logging (if not already configured elsewhere)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Import functions from other modules
-# These now interact with persistence and agent manager
-from ..gemini.tools import (
-    create_trading_agent, # Renamed back for clarity
-    start_trading_agent,
-    stop_trading_agent,
-    get_agent_status,
-    list_trading_agents,
-    delete_trading_agent,
-    get_detailed_performance,
-    get_pnl_summary,
-    # Tools are no longer directly called by most API endpoints
-)
 # Import the Gemini interaction layer
 from ..gemini.interaction import process_natural_language_request
 # Import DB session dependency, CRUD functions, and models
 from ..persistence import crud, models
 from ..persistence.database import get_db
-from ..persistence.models import AgentStatusEnum, StrategyTypeEnum # Import Enums
+from ..persistence.models import AgentStatusEnum, StrategyTypeEnum, AgentGroup # Import Enums & Models
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError # For catching DB errors
 # Import agent manager for start/stop actions
 from ..core import agent_manager
 # Import tools for validation models
 from ..gemini import tools
-from sqlalchemy.exc import IntegrityError
-# Import AgentGroup model
-from ..persistence.models import AgentGroup
 # Import Learning/Communication components
 from ..learning.analyzer import PerformanceAnalyzer
 from ..communication.redis_pubsub import CommunicationBus # Assuming a singleton or factory needed
 # (Note: Managing singletons like comm_bus in FastAPI needs care, e.g., lifespan events)
 
 # --- Temp Singleton for CommBus (Replace with proper lifespan management) ---
-temp_comm_bus_instance = CommunicationBus()
+# This should ideally be managed via FastAPI lifespan events for cleaner setup/teardown
+try:
+    temp_comm_bus_instance = CommunicationBus()
+except Exception as e:
+    logging.error(f"Failed to initialize CommunicationBus singleton: {e}")
+    temp_comm_bus_instance = None
 
 # --- Security (Authentication Placeholder) ---
 # Example using OAuth2 Password Bearer flow. Replace with your actual auth mechanism.
@@ -70,19 +62,11 @@ class AgentConfigBase(BaseModel):
 # Reuse validation models from tools.py
 class ArbitrageConfig(tools.ArbitrageConfigModel):
     """Configuration specific to the Arbitrage strategy."""
-    pair_1: str = Field(..., description="First symbol of the arbitrage triangle (e.g., BTCUSDT)")
-    pair_2: str = Field(..., description="Second symbol of the arbitrage triangle (e.g., ETHBTC)")
-    pair_3: str = Field(..., description="Third symbol of the arbitrage triangle (e.g., ETHUSDT)")
-    min_profit_pct: float = Field(..., gt=0, description="Minimum profit percentage to trigger trade")
-    trade_amount_usd: float = Field(..., gt=0, description="Approximate USD value to trade per cycle")
+    pass # Fields are inherited
 
 class GridConfig(tools.GridConfigModel):
     """Configuration specific to the Grid strategy."""
-    symbol: str = Field(..., description="Trading pair symbol (e.g., BTCUSDT)")
-    lower_price: float = Field(..., gt=0, description="Lower bound of the grid")
-    upper_price: float = Field(..., gt=0, description="Upper bound of the grid")
-    grid_levels: int = Field(..., gt=1, description="Number of grid lines")
-    order_amount_usd: float = Field(..., gt=0, description="Approximate USD value per grid order")
+    pass # Fields are inherited
 
 class CreateAgentRequest(BaseModel):
     """Request body for creating a new agent."""
@@ -101,7 +85,7 @@ class UpdateAgentRequest(BaseModel):
 
 class AgentStatusResponse(BaseModel):
     """Response model for individual agent status (subset of tool response)."""
-    agent_id: str
+    agent_id: int # Use integer ID now
     name: str
     strategy: str
     status: str
@@ -136,7 +120,7 @@ class AgentDetailResponse(BaseModel):
 
 class AgentActionResponse(BaseModel):
     """Generic response for actions like start, stop, delete, create."""
-    agent_id: str
+    agent_id: str # Keep as string for response consistency? Or int? Let's use int.
     status: Optional[str] = None
     message: str
     deleted: Optional[bool] = None # For delete confirmation
@@ -150,7 +134,7 @@ class PerformanceResponse(BaseModel):
 
 class PnlSummaryResponse(BaseModel):
     """Response model for PnL summary."""
-    agent_id: str
+    agent_id: int # Use int ID
     summary: Optional[Dict[str, Any]] = None # Contains the PnL summary dict
     message: Optional[str] = None # For errors
 
@@ -185,6 +169,13 @@ class AgentGroupResponse(AgentGroupBase):
     class Config:
         orm_mode = True # Enable ORM mode for automatic mapping
 
+# --- Analysis Models ---
+class AnalysisResponse(BaseModel):
+    status: str
+    analysis_summary: Optional[str] = None
+    suggestion_or_insight: Optional[Dict] = None
+    error: Optional[str] = None
+
 
 # --- FastAPI App Initialization ---
 # Add notes about backtesting and risks
@@ -213,6 +204,8 @@ app = FastAPI(
 # Add security dependencies (Depends(get_current_user)) to protected routes
 
 # TODO: Add rate limiting (e.g., using slowapi)
+
+# --- Agent Endpoints ---
 
 @app.post("/agents", response_model=AgentActionResponse, status_code=status.HTTP_201_CREATED, tags=["Agents"])
 async def api_create_agent(
@@ -380,6 +373,7 @@ async def api_update_agent(
     # Validate config if provided
     if agent_update.config:
         try:
+            # Need to access the enum member, not its value for comparison
             if db_agent.strategy_type == StrategyTypeEnum.ARBITRAGE:
                 ArbitrageConfig(**agent_update.config)
             elif db_agent.strategy_type == StrategyTypeEnum.GRID:
@@ -418,6 +412,203 @@ async def api_update_agent(
     except Exception as e:
         logging.exception(f"Database error updating agent {agent_id}: {e}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Database error updating agent.")
+
+
+@app.post("/agents/{agent_id}/start", response_model=AgentActionResponse, tags=["Agents"])
+async def api_start_agent(agent_id: int, current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+    """
+    Start a specific trading agent. Requires authentication.
+    Uses agent_manager to start process and CRUD to update status.
+    """
+    logging.info(f"User {current_user['username']} attempting to start agent {agent_id}")
+    db_agent = crud.get_agent_by_id(db, agent_id)
+    if not db_agent:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Agent with ID {agent_id} not found")
+
+    if db_agent.status == AgentStatusEnum.RUNNING:
+         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Agent is already running.")
+    if agent_manager.is_agent_running(str(agent_id)):
+         logging.warning(f"API Start: Correcting DB status for agent {agent_id} which is running in manager.")
+         crud.update_agent_status(db, agent_id, AgentStatusEnum.RUNNING, "Status corrected from manager state")
+         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Agent is already running (status corrected).")
+
+    # --- Initiate Start Process ---
+    try:
+        success = agent_manager.start_agent_process(
+            agent_id=str(agent_id),
+            strategy_type=db_agent.strategy_type.value,
+            config=db_agent.config
+        )
+        if success:
+            updated_agent = crud.update_agent_status(db, agent_id, AgentStatusEnum.STARTING)
+            logging.info(f"Agent {agent_id} start initiated via API.")
+            return AgentActionResponse(
+                agent_id=str(agent_id),
+                status=AgentStatusEnum.STARTING.value,
+                message=f"Agent {agent_id} start initiated."
+            )
+        else:
+            # Agent manager failed (e.g., race condition?)
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to initiate agent start via manager.")
+    except Exception as e:
+        logging.exception(f"Error starting agent {agent_id} process: {e}")
+        crud.update_agent_status(db, agent_id, AgentStatusEnum.ERROR, f"Failed to start: {str(e)}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error starting agent process: {str(e)}")
+
+
+@app.post("/agents/{agent_id}/stop", response_model=AgentActionResponse, tags=["Agents"])
+async def api_stop_agent(agent_id: int, current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+    """
+    Stop a specific trading agent. Requires authentication.
+    Uses agent_manager to stop process and CRUD to update status.
+    """
+    logging.info(f"User {current_user['username']} attempting to stop agent {agent_id}")
+    db_agent = crud.get_agent_by_id(db, agent_id)
+    if not db_agent:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Agent with ID {agent_id} not found")
+
+    can_stop_status = [AgentStatusEnum.RUNNING, AgentStatusEnum.STARTING, AgentStatusEnum.ERROR]
+    if db_agent.status not in can_stop_status and not agent_manager.is_agent_running(str(agent_id)):
+         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Agent is not in a stoppable state (status: {db_agent.status.value}).")
+
+    # --- Initiate Stop Process ---
+    try:
+        success = agent_manager.stop_agent_process(str(agent_id))
+        if success:
+            updated_agent = crud.update_agent_status(db, agent_id, AgentStatusEnum.STOPPING)
+            logging.info(f"Agent {agent_id} stop initiated via API.")
+            return AgentActionResponse(
+                agent_id=str(agent_id),
+                status=AgentStatusEnum.STOPPING.value,
+                message=f"Agent {agent_id} stop initiated."
+            )
+        else:
+             # If manager says it wasn't running, but DB state was stoppable, maybe just update DB?
+             if db_agent.status in can_stop_status:
+                 logging.warning(f"Agent manager reported agent {agent_id} not running during stop, but DB status was {db_agent.status.value}. Updating DB status to STOPPED.")
+                 crud.update_agent_status(db, agent_id, AgentStatusEnum.STOPPED, "Stopped via API after manager reported not running")
+                 return AgentActionResponse(agent_id=str(agent_id), status=AgentStatusEnum.STOPPED.value, message="Agent likely already stopped; status updated.")
+             else:
+                raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to initiate agent stop via manager.")
+    except Exception as e:
+        logging.exception(f"Error stopping agent {agent_id} process: {e}")
+        # Consider setting status to ERROR if stop fails unexpectedly?
+        # crud.update_agent_status(db, agent_id, AgentStatusEnum.ERROR, f"Failed to stop: {str(e)}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error stopping agent process: {str(e)}")
+
+
+@app.delete("/agents/{agent_id}", response_model=AgentActionResponse, tags=["Agents"])
+async def api_delete_agent(agent_id: int, current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+    """
+    Delete a specific trading agent. Requires authentication.
+    Stops the agent process first, then deletes from DB.
+    """
+    logging.warning(f"User {current_user['username']} attempting to DELETE agent {agent_id}")
+    db_agent = crud.get_agent_by_id(db, agent_id)
+    if not db_agent:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Agent with ID {agent_id} not found")
+
+    # --- Stop Agent if Running ---
+    try:
+        if agent_manager.is_agent_running(str(agent_id)) or db_agent.status in [AgentStatusEnum.RUNNING, AgentStatusEnum.STARTING]:
+            logging.info(f"Stopping agent {agent_id} before deletion.")
+            agent_manager.stop_agent_process(str(agent_id))
+            # Update status briefly? Or just proceed to delete?
+            # crud.update_agent_status(db, agent_id, AgentStatusEnum.STOPPING)
+            # time.sleep(0.5) # Small delay? Risky. Better if stop_agent_process was synchronous/blocking.
+    except Exception as stop_err:
+         # Log error but proceed with deletion attempt
+         logging.error(f"Error stopping agent {agent_id} during delete: {stop_err}. Proceeding with DB deletion.")
+
+    # --- Delete from Persistence ---
+    try:
+        deleted = crud.delete_agent(db, agent_id)
+        if deleted:
+            logging.info(f"Agent {agent_id} data successfully deleted from DB via API.")
+            return AgentActionResponse(
+                agent_id=str(agent_id),
+                deleted=True,
+                message=f"Agent {agent_id} successfully deleted."
+            )
+        else:
+            # Should not happen if agent was found initially
+             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Agent found initially but failed to delete from database.")
+    except Exception as e:
+        logging.exception(f"Database error deleting agent {agent_id}: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Database error deleting agent: {str(e)}")
+
+
+@app.get("/agents/{agent_id}/performance", response_model=PerformanceResponse, tags=["Performance"])
+async def api_get_performance(
+    agent_id: int,
+    time_period: Optional[Literal["1h", "6h", "24h", "7d", "all"]] = Query("24h", description="Time period for performance data"),
+    current_user: dict = Depends(get_current_user), # Protect endpoint
+    db: Session = Depends(get_db)
+):
+    """
+    Get detailed performance data (trades, KPIs) for a specific agent. Requires authentication.
+    """
+    logging.info(f"User {current_user['username']} getting performance for agent {agent_id}, period {time_period}")
+    db_agent = crud.get_agent_by_id(db, agent_id)
+    if not db_agent:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Agent with ID {agent_id} not found")
+
+    try:
+        # TODO: Implement actual KPI calculations and time filtering in CRUD
+        trades = crud.get_trades_for_agent(db, agent_id, limit=5000) # Get recent trades
+
+        # Placeholder calculations
+        total_pnl = sum(t.pnl_usd for t in trades if t.pnl_usd is not None)
+        total_trades = len(trades)
+        winning_trades = sum(1 for t in trades if t.pnl_usd is not None and t.pnl_usd > 0)
+        win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0
+
+        trade_list = [
+            {
+                "timestamp": t.timestamp.isoformat(), "symbol": t.symbol, "side": t.side,
+                "price": t.price, "quantity": t.quantity, "order_id": t.order_id, "pnl_usd": t.pnl_usd
+            } for t in trades[-100:] # Limit response size
+        ]
+
+        performance_data = {
+            "total_pnl_usd": round(total_pnl, 2),
+            "win_rate_pct": round(win_rate, 1),
+            "total_trades": total_trades,
+            "sharpe_ratio": 0.0, # Placeholder
+            "trades": trade_list,
+        }
+
+        return PerformanceResponse(
+            agent_id=agent_id, # Return int ID
+            time_period=time_period,
+            data=performance_data,
+            message=f"Displaying last {len(trade_list)} trades." if total_trades > 100 else None
+        )
+    except Exception as e:
+        logging.exception(f"Error calculating performance for agent {agent_id}: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error calculating performance: {str(e)}")
+
+
+@app.get("/agents/{agent_id}/pnl", response_model=PnlSummaryResponse, tags=["Performance"])
+async def api_get_pnl(agent_id: int, current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+    """
+    Get the PnL summary for a specific agent. Requires authentication.
+    """
+    logging.info(f"User {current_user['username']} getting PnL summary for agent {agent_id}")
+    db_agent = crud.get_agent_by_id(db, agent_id)
+    if not db_agent:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Agent with ID {agent_id} not found")
+
+    try:
+        summary = crud.calculate_agent_pnl_summary(db, agent_id)
+        if not summary:
+             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Could not calculate PnL summary.")
+
+        # return PnlSummaryResponse(agent_id=str(agent_id), summary=summary) # Keep agent_id as string here? Let's make it int
+        return PnlSummaryResponse(agent_id=agent_id, summary=summary)
+    except Exception as e:
+        logging.exception(f"Error calculating PnL summary for agent {agent_id}: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error calculating PnL summary: {str(e)}")
 
 
 # --- Agent Group Endpoints ---
@@ -615,377 +806,6 @@ async def trigger_group_analysis(
         return AnalysisResponse(status="error", error=str(e))
 
 
-@app.post("/agents/{agent_id}/start", response_model=AgentActionResponse, tags=["Agents"])
-async def api_start_agent(agent_id: int, current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
-    """
-    Start a specific trading agent. Requires authentication.
-    Uses agent_manager to start process and CRUD to update status.
-    """
-    logging.info(f"User {current_user['username']} attempting to start agent {agent_id}")
-    db_agent = crud.get_agent_by_id(db, agent_id)
-    if not db_agent:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Agent with ID {agent_id} not found")
-
-    if db_agent.status == AgentStatusEnum.RUNNING:
-         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Agent is already running.")
-    if agent_manager.is_agent_running(str(agent_id)):
-         logging.warning(f"API Start: Correcting DB status for agent {agent_id} which is running in manager.")
-         crud.update_agent_status(db, agent_id, AgentStatusEnum.RUNNING, "Status corrected from manager state")
-         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Agent is already running (status corrected).")
-
-    # --- Initiate Start Process ---
-    try:
-        success = agent_manager.start_agent_process(
-            agent_id=str(agent_id),
-            strategy_type=db_agent.strategy_type.value,
-            config=db_agent.config
-        )
-        if success:
-            updated_agent = crud.update_agent_status(db, agent_id, AgentStatusEnum.STARTING)
-            logging.info(f"Agent {agent_id} start initiated via API.")
-            return AgentActionResponse(
-                agent_id=str(agent_id),
-                status=AgentStatusEnum.STARTING.value,
-                message=f"Agent {agent_id} start initiated."
-            )
-        else:
-            # Agent manager failed (e.g., race condition?)
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to initiate agent start via manager.")
-    except Exception as e:
-        logging.exception(f"Error starting agent {agent_id} process: {e}")
-        crud.update_agent_status(db, agent_id, AgentStatusEnum.ERROR, f"Failed to start: {str(e)}")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error starting agent process: {str(e)}")
-
-
-@app.post("/agents/{agent_id}/stop", response_model=AgentActionResponse, tags=["Agents"])
-async def api_stop_agent(agent_id: int, current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
-    """
-    Stop a specific trading agent. Requires authentication.
-    Uses agent_manager to stop process and CRUD to update status.
-    """
-    logging.info(f"User {current_user['username']} attempting to stop agent {agent_id}")
-    db_agent = crud.get_agent_by_id(db, agent_id)
-    if not db_agent:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Agent with ID {agent_id} not found")
-
-    can_stop_status = [AgentStatusEnum.RUNNING, AgentStatusEnum.STARTING, AgentStatusEnum.ERROR]
-    if db_agent.status not in can_stop_status and not agent_manager.is_agent_running(str(agent_id)):
-         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Agent is not in a stoppable state (status: {db_agent.status.value}).")
-
-    # --- Initiate Stop Process ---
-    try:
-        success = agent_manager.stop_agent_process(str(agent_id))
-        if success:
-            updated_agent = crud.update_agent_status(db, agent_id, AgentStatusEnum.STOPPING)
-            logging.info(f"Agent {agent_id} stop initiated via API.")
-            return AgentActionResponse(
-                agent_id=str(agent_id),
-                status=AgentStatusEnum.STOPPING.value,
-                message=f"Agent {agent_id} stop initiated."
-            )
-        else:
-             # If manager says it wasn't running, but DB state was stoppable, maybe just update DB?
-             if db_agent.status in can_stop_status:
-                 logging.warning(f"Agent manager reported agent {agent_id} not running during stop, but DB status was {db_agent.status.value}. Updating DB status to STOPPED.")
-                 crud.update_agent_status(db, agent_id, AgentStatusEnum.STOPPED, "Stopped via API after manager reported not running")
-                 return AgentActionResponse(agent_id=str(agent_id), status=AgentStatusEnum.STOPPED.value, message="Agent likely already stopped; status updated.")
-             else:
-                raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to initiate agent stop via manager.")
-    except Exception as e:
-        logging.exception(f"Error stopping agent {agent_id} process: {e}")
-        # Consider setting status to ERROR if stop fails unexpectedly?
-        # crud.update_agent_status(db, agent_id, AgentStatusEnum.ERROR, f"Failed to stop: {str(e)}")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error stopping agent process: {str(e)}")
-
-
-@app.delete("/agents/{agent_id}", response_model=AgentActionResponse, tags=["Agents"])
-async def api_delete_agent(agent_id: int, current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
-    """
-    Delete a specific trading agent. Requires authentication.
-    Stops the agent process first, then deletes from DB.
-    """
-    logging.warning(f"User {current_user['username']} attempting to DELETE agent {agent_id}")
-    db_agent = crud.get_agent_by_id(db, agent_id)
-    if not db_agent:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Agent with ID {agent_id} not found")
-
-    # --- Stop Agent if Running ---
-    try:
-        if agent_manager.is_agent_running(str(agent_id)) or db_agent.status in [AgentStatusEnum.RUNNING, AgentStatusEnum.STARTING]:
-            logging.info(f"Stopping agent {agent_id} before deletion.")
-            agent_manager.stop_agent_process(str(agent_id))
-            # Update status briefly? Or just proceed to delete?
-            # crud.update_agent_status(db, agent_id, AgentStatusEnum.STOPPING)
-            # time.sleep(0.5) # Small delay? Risky. Better if stop_agent_process was synchronous/blocking.
-    except Exception as stop_err:
-         # Log error but proceed with deletion attempt
-         logging.error(f"Error stopping agent {agent_id} during delete: {stop_err}. Proceeding with DB deletion.")
-
-    # --- Delete from Persistence ---
-    try:
-        deleted = crud.delete_agent(db, agent_id)
-        if deleted:
-            logging.info(f"Agent {agent_id} data successfully deleted from DB via API.")
-            return AgentActionResponse(
-                agent_id=str(agent_id),
-                deleted=True,
-                message=f"Agent {agent_id} successfully deleted."
-            )
-        else:
-            # Should not happen if agent was found initially
-             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Agent found initially but failed to delete from database.")
-    except Exception as e:
-        logging.exception(f"Database error deleting agent {agent_id}: {e}")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Database error deleting agent: {str(e)}")
-
-
-@app.get("/agents/{agent_id}/performance", response_model=PerformanceResponse, tags=["Performance"])
-async def api_get_performance(
-    agent_id: int,
-    time_period: Optional[Literal["1h", "6h", "24h", "7d", "all"]] = Query("24h", description="Time period for performance data"),
-    current_user: dict = Depends(get_current_user), # Protect endpoint
-    db: Session = Depends(get_db)
-):
-    """
-    Get detailed performance data (trades, KPIs) for a specific agent. Requires authentication.
-    """
-    logging.info(f"User {current_user['username']} getting performance for agent {agent_id}, period {time_period}")
-    db_agent = crud.get_agent_by_id(db, agent_id)
-    if not db_agent:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Agent with ID {agent_id} not found")
-
-    try:
-        # TODO: Implement actual KPI calculations and time filtering in CRUD
-        trades = crud.get_trades_for_agent(db, agent_id, limit=5000) # Get recent trades
-
-        # Placeholder calculations
-        total_pnl = sum(t.pnl_usd for t in trades if t.pnl_usd is not None)
-        total_trades = len(trades)
-        winning_trades = sum(1 for t in trades if t.pnl_usd is not None and t.pnl_usd > 0)
-        win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0
-
-        trade_list = [
-            {
-                "timestamp": t.timestamp.isoformat(), "symbol": t.symbol, "side": t.side,
-                "price": t.price, "quantity": t.quantity, "order_id": t.order_id, "pnl_usd": t.pnl_usd
-            } for t in trades[-100:] # Limit response size
-        ]
-
-        performance_data = {
-            "total_pnl_usd": round(total_pnl, 2),
-            "win_rate_pct": round(win_rate, 1),
-            "total_trades": total_trades,
-            "sharpe_ratio": 0.0, # Placeholder
-            "trades": trade_list,
-        }
-
-        return PerformanceResponse(
-            agent_id=str(agent_id),
-            time_period=time_period,
-            data=performance_data,
-            message=f"Displaying last {len(trade_list)} trades." if total_trades > 100 else None
-        )
-    except Exception as e:
-        logging.exception(f"Error calculating performance for agent {agent_id}: {e}")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error calculating performance: {str(e)}")
-
-
-@app.get("/agents/{agent_id}/pnl", response_model=PnlSummaryResponse, tags=["Performance"])
-async def api_get_pnl(agent_id: int, current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
-    """
-    Get the PnL summary for a specific agent. Requires authentication.
-    """
-    logging.info(f"User {current_user['username']} getting PnL summary for agent {agent_id}")
-    db_agent = crud.get_agent_by_id(db, agent_id)
-    if not db_agent:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Agent with ID {agent_id} not found")
-
-    try:
-        summary = crud.calculate_agent_pnl_summary(db, agent_id)
-        if not summary:
-             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Could not calculate PnL summary.")
-
-        return PnlSummaryResponse(agent_id=str(agent_id), summary=summary)
-    except Exception as e:
-        logging.exception(f"Error calculating PnL summary for agent {agent_id}: {e}")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error calculating PnL summary: {str(e)}")
-
-
-# --- Agent Group Endpoints ---
-
-@app.post("/groups", response_model=AgentGroupResponse, status_code=status.HTTP_201_CREATED, tags=["Groups"])
-async def api_create_agent_group(
-    group_data: AgentGroupCreate,
-    current_user: dict = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    """Create a new agent group."""
-    logging.info(f"User {current_user['username']} creating agent group '{group_data.name}'")
-    try:
-        db_group = crud.create_agent_group(db, name=group_data.name, description=group_data.description)
-        return db_group # Pydantic automatically handles conversion due to orm_mode=True
-    except ValueError as e: # Handles duplicate name error from CRUD
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
-    except Exception as e:
-        logging.exception(f"Database error creating agent group '{group_data.name}': {e}")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Database error creating agent group.")
-
-@app.get("/groups", response_model=List[AgentGroupResponse], tags=["Groups"])
-async def api_list_agent_groups(
-    current_user: dict = Depends(get_current_user),
-    db: Session = Depends(get_db),
-    skip: int = 0,
-    limit: int = 100
-):
-    """List all agent groups."""
-    logging.info(f"User {current_user['username']} listing agent groups (skip={skip}, limit={limit})")
-    try:
-        groups = crud.get_agent_groups(db, skip=skip, limit=limit)
-        return groups
-    except Exception as e:
-        logging.exception(f"Database error listing agent groups: {e}")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Database error listing agent groups.")
-
-@app.get("/groups/{group_id}", response_model=AgentGroupResponse, tags=["Groups"])
-async def api_get_agent_group(
-    group_id: int,
-    current_user: dict = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    """Get details for a specific agent group."""
-    logging.info(f"User {current_user['username']} getting details for group {group_id}")
-    db_group = crud.get_agent_group_by_id(db, group_id)
-    if not db_group:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Agent group with ID {group_id} not found")
-    return db_group
-
-@app.put("/groups/{group_id}", response_model=AgentGroupResponse, tags=["Groups"])
-async def api_update_agent_group(
-    group_id: int,
-    group_update: AgentGroupUpdate,
-    current_user: dict = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    """Update an agent group's details (name, description)."""
-    logging.info(f"User {current_user['username']} updating group {group_id} with data: {group_update.dict(exclude_unset=True)}")
-    try:
-        updated_group = crud.update_agent_group(
-            db, group_id=group_id, name=group_update.name, description=group_update.description
-        )
-        if not updated_group:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Agent group with ID {group_id} not found")
-        return updated_group
-    except ValueError as e: # Handles duplicate name error from CRUD
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
-    except Exception as e:
-        logging.exception(f"Database error updating agent group {group_id}: {e}")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Database error updating agent group.")
-
-@app.delete("/groups/{group_id}", status_code=status.HTTP_204_NO_CONTENT, tags=["Groups"])
-async def api_delete_agent_group(
-    group_id: int,
-    current_user: dict = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    """Delete an agent group. Fails if the group contains agents."""
-    logging.warning(f"User {current_user['username']} attempting to DELETE agent group {group_id}")
-    try:
-        deleted = crud.delete_agent_group(db, group_id)
-        if not deleted:
-            # Should be caught by CRUD check, but defensive
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Agent group with ID {group_id} not found")
-        # No content to return on successful delete
-    except ValueError as e: # Catches "group not empty" error from CRUD
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
-    except Exception as e:
-        logging.exception(f"Database error deleting agent group {group_id}: {e}")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Database error deleting agent group.")
-
-
-@app.get("/groups/{group_id}/agents", response_model=List[AgentBasicInfo], tags=["Groups"])
-async def api_list_agents_in_group(
-    group_id: int,
-    current_user: dict = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    """List all agents belonging to a specific group."""
-    logging.info(f"User {current_user['username']} listing agents for group {group_id}")
-    # Check if group exists first
-    db_group = crud.get_agent_group_by_id(db, group_id)
-    if not db_group:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Agent group with ID {group_id} not found")
-
-    try:
-        db_agents = crud.get_agents_in_group(db, group_id=group_id)
-        return [
-            AgentBasicInfo(
-                agent_id=agent.id, name=agent.name, strategy=agent.strategy_type.value,
-                status=agent.status.value, group_id=agent.group_id
-            ) for agent in db_agents
-        ]
-    except Exception as e:
-        logging.exception(f"Database error listing agents for group {group_id}: {e}")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Database error listing agents for group.")
-
-
-# --- Learning / Analysis Endpoints (Testing Phase) ---
-
-class AnalysisResponse(BaseModel):
-    status: str
-    analysis_summary: Optional[str] = None
-    suggestion_or_insight: Optional[Dict] = None
-    error: Optional[str] = None
-
-@app.post("/analysis/agent/{agent_id}", response_model=AnalysisResponse, tags=["Analysis (Testing)"])
-async def trigger_agent_analysis(
-    agent_id: int,
-    current_user: dict = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    """Manually trigger performance analysis for a specific agent."""
-    logging.info(f"User {current_user['username']} triggering analysis for agent {agent_id}")
-    db_agent = crud.get_agent_by_id(db, agent_id)
-    if not db_agent:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Agent with ID {agent_id} not found")
-
-    if not temp_comm_bus_instance or not temp_comm_bus_instance.is_ready():
-         # Analyze anyway, but log that suggestions won't be published
-         logging.warning(f"Comm bus not ready, analysis for agent {agent_id} will run without publishing.")
-
-    try:
-        # Instantiate analyzer with current session and comm bus
-        analyzer = PerformanceAnalyzer(db_session=db, comm_bus=temp_comm_bus_instance)
-        summary, suggestion = analyzer.analyze_agent_performance(agent_id)
-        return AnalysisResponse(status="completed", analysis_summary=summary, suggestion_or_insight=suggestion)
-    except Exception as e:
-        logging.exception(f"Error during manual analysis trigger for agent {agent_id}: {e}")
-        return AnalysisResponse(status="error", error=str(e))
-
-
-@app.post("/analysis/group/{group_id}", response_model=AnalysisResponse, tags=["Analysis (Testing)"])
-async def trigger_group_analysis(
-    group_id: int,
-    current_user: dict = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    """Manually trigger performance analysis for a specific agent group."""
-    logging.info(f"User {current_user['username']} triggering analysis for group {group_id}")
-    db_group = crud.get_agent_group_by_id(db, group_id)
-    if not db_group:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Agent group with ID {group_id} not found")
-
-    if not temp_comm_bus_instance or not temp_comm_bus_instance.is_ready():
-         logging.warning(f"Comm bus not ready, analysis for group {group_id} will run without publishing.")
-
-    try:
-        analyzer = PerformanceAnalyzer(db_session=db, comm_bus=temp_comm_bus_instance)
-        summary, insight = analyzer.analyze_group_performance(group_id)
-        return AnalysisResponse(status="completed", analysis_summary=summary, suggestion_or_insight=insight)
-    except Exception as e:
-        logging.exception(f"Error during manual analysis trigger for group {group_id}: {e}")
-        return AnalysisResponse(status="error", error=str(e))
-
-
 # --- Optional Gemini Interaction Endpoint ---
 # This endpoint still uses the interaction layer which calls tools directly.
 # For consistency, this could be refactored to resolve agent names/IDs to DB IDs
@@ -998,7 +818,15 @@ async def handle_gemini_command(request: GeminiRequest, current_user: dict = Dep
     (Optional) Endpoint to process natural language commands via the Gemini interaction layer. Requires authentication.
     **WARNING:** This endpoint allows Gemini to call tools that might modify state. Ensure `ENABLE_STATE_MODIFICATION` in `tools.py` is set appropriately.
     The interaction layer currently creates its own DB sessions for tool execution.
+    *** NOTE: Gemini tool functionality is temporarily disabled due to library schema issues. ***
     """
+    # Immediately return error indicating disabled functionality
+    raise HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail="Gemini command processing is temporarily disabled due to tool schema generation issues."
+    )
+
+    # --- Original Logic (kept below, but unreachable) ---
     logging.info(f"User {current_user['username']} sending Gemini command: '{request.prompt}'")
     # TODO: Consider adding logic here or in interaction layer to map user-friendly names
     # (e.g., "my btc bot") from the prompt to the correct agent DB ID before calling tools.

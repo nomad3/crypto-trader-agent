@@ -1,5 +1,5 @@
 import logging
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple # Import Tuple
 from sqlalchemy.orm import Session
 import pandas as pd
 from sklearn.linear_model import LinearRegression # Example ML model
