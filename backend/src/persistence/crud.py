@@ -198,6 +198,39 @@ def delete_agent_group(db: Session, group_id: int) -> bool:
         raise
 
 
+# --- Group Performance ---
+
+def get_group_performance_summary(db: Session, group_id: int) -> Dict[str, Any]:
+    """Calculates aggregated performance summary for all agents in a group."""
+    agents_in_group = get_agents_in_group(db, group_id)
+    if not agents_in_group:
+        return {"message": "No agents found in this group.", "total_agents": 0}
+
+    total_realized_pnl = 0.0
+    total_trades_all_agents = 0
+    # More complex metrics would require iterating through individual agent trades or pre-aggregated data
+    # For MVP, we use the placeholder agent summary calculation
+
+    agent_pnl_summaries = []
+    for agent in agents_in_group:
+        summary = calculate_agent_pnl_summary(db, agent.id) # Uses placeholder calc
+        agent_pnl_summaries.append(summary)
+        total_realized_pnl += summary.get("realized_pnl_total_usd", 0.0)
+        # Need a way to get total trades per agent if not in summary
+        # trades = get_trades_for_agent(db, agent.id, limit=100000) # Potentially very slow
+        # total_trades_all_agents += len(trades)
+
+    # Placeholder for aggregated metrics
+    # TODO: Implement more sophisticated aggregation (avg win rate, Sharpe, etc.)
+    return {
+        "group_id": group_id,
+        "total_agents": len(agents_in_group),
+        "aggregated_realized_pnl_usd": round(total_realized_pnl, 2),
+        # "total_trades": total_trades_all_agents, # Example
+        "message": "Note: PnL calculations are based on placeholder logic."
+    }
+
+
 # --- Trade CRUD ---
 
 def create_trade(db: Session, agent_id: int, trade_data: Dict[str, Any]) -> models.Trade:

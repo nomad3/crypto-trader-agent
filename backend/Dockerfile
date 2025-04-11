@@ -9,9 +9,12 @@ ENV PYTHONUNBUFFERED 1
 WORKDIR /app
 
 # Install system dependencies
-# For psycopg2-binary, usually no extra deps needed on standard Python images.
-# If using source psycopg2, uncomment below:
-# RUN apt-get update && apt-get install -y --no-install-recommends gcc libpq-dev && rm -rf /var/lib/apt/lists/*
+# Add build-essential for potential C extensions in ML libs
+# For psycopg2-binary, usually no extra deps needed.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    # Add other potential dependencies for ML libs if needed (e.g., libatlas-base-dev for numpy/scipy speedups) \
+    && rm -rf /var/lib/apt/lists/*
 
 # Install pip requirements
 # Copy only requirements first to leverage Docker cache

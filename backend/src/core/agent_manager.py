@@ -3,15 +3,17 @@
 import time
 import threading
 import logging
-from typing import Dict, Any, Optional, Type
+from typing import Dict, Any, Optional, Type, List # Import List
 from sqlalchemy.orm import Session
 
 # Import necessary components
 from ..strategies.base_strategy import BaseStrategy
 from ..strategies.grid_strategy import GridStrategy
-# from ..strategies.arbitrage_strategy import ArbitrageStrategy # Import when implemented
-from ..persistence import database # Need session factory
+# from ..strategies.arbitrage_strategy import ArbitrageStrategy
+from ..persistence import database
 from .binance_client import BinanceClientWrapper
+# Import communication bus
+from ..communication.redis_pubsub import CommunicationBus
 
 log = logging.getLogger(__name__)
 
@@ -25,11 +27,11 @@ STRATEGY_MAP: Dict[str, Type[BaseStrategy]] = {
 # --- Runtime Agent Store ---
 # Stores references to running strategy instances and threads
 # Key: agent_id (string representation of DB int ID)
-# Value: {"instance": BaseStrategy, "thread": threading.Thread, "start_time": float}
+# Value: {"instance": BaseStrategy, "thread": threading.Thread, "start_time": float, "comm_bus": CommunicationBus}
 _running_agents: Dict[str, Dict[str, Any]] = {}
-_lock = threading.Lock() # Lock for thread safety when modifying _running_agents
+_lock = threading.Lock()
 
-# --- Shared Binance Client ---
+# --- Shared Services ---
 # Create a single client instance to be shared by all agents
 # Ensure API keys are loaded via decouple/dotenv before this is instantiated
 # Handle potential initialization failure
@@ -41,7 +43,17 @@ try:
         # raise RuntimeError("Failed to initialize Binance Client")
 except Exception as e:
      log.critical(f"Agent Manager: Exception during shared Binance Client initialization: {e}")
-     binance_client_instance = None # Ensure it's None if init fails
+     binance_client_instance = None
+
+# Create a single communication bus instance (optional, could be managed elsewhere)
+try:
+    comm_bus_instance = CommunicationBus()
+    if not comm_bus_instance.is_ready():
+         log.warning("Agent Manager: Communication Bus failed to connect to Redis. Inter-agent features disabled.")
+         comm_bus_instance = None # Set to None if not ready
+except Exception as e:
+     log.critical(f"Agent Manager: Exception during Communication Bus initialization: {e}")
+     comm_bus_instance = None
 
 
 def start_agent_process(agent_id: str, strategy_type: str, config: Dict[str, Any]) -> bool:
@@ -73,10 +85,11 @@ def start_agent_process(agent_id: str, strategy_type: str, config: Dict[str, Any
         try:
             # Instantiate the strategy
             strategy_instance = StrategyClass(
-                agent_id=int(agent_id), # Strategy expects int ID
+                agent_id=int(agent_id),
                 config=config,
-                db_session=db_session, # Pass the dedicated session
-                binance_client=binance_client_instance # Pass shared client
+                db_session=db_session,
+                binance_client=binance_client_instance,
+                comm_bus=comm_bus_instance # Pass shared comm bus instance
             )
 
             # Start the strategy's run loop in a new thread
@@ -86,9 +99,10 @@ def start_agent_process(agent_id: str, strategy_type: str, config: Dict[str, Any
             # Store the instance and thread info
             _running_agents[agent_id] = {
                 "instance": strategy_instance,
-                "thread": strategy_instance._thread, # Access thread from instance
+                "thread": strategy_instance._thread,
                 "start_time": time.time(),
-                "strategy_type": strategy_type
+                "strategy_type": strategy_type,
+                "comm_bus": comm_bus_instance # Store reference if needed later
             }
             log.info(f"Agent Manager: Strategy thread for agent {agent_id} started.")
             # Note: Status is updated to STARTING by API/Tool, then RUNNING/ERROR by the strategy thread itself.

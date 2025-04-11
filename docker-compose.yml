@@ -22,6 +22,22 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+      start_period: 10s # Give it time to start before first check
+
+  redis:
+    image: redis:7-alpine
+    container_name: crypto-trader-redis
+    ports:
+      # Expose Redis port externally if needed (optional)
+      - "6379:6379"
+    networks:
+      - crypto-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
 
   backend:
     build:
@@ -39,9 +55,11 @@ services:
       # - ./backend/trading_agents.db:/app/backend/trading_agents.db
     ports:
       - "8000:8000"
-    # Ensure backend starts only after the database is healthy
+    # Ensure backend starts only after DB and Redis are healthy
     depends_on:
       db:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     networks:
       - crypto-net

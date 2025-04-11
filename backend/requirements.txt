@@ -8,4 +8,9 @@ sqlalchemy >= 1.4 # Use a version compatible with potential async later
 alembic # For database migrations
 python-decouple # Alternative for config/env vars
 psycopg2-binary # PostgreSQL driver
-# For Async (if switching later): asyncpg, greenlet
+redis # For inter-agent communication / caching
+pandas # For data analysis
+scikit-learn # For ML algorithms & utilities
+# tensorflow # Optional: Uncomment if using TensorFlow/Keras directly
+# keras # Optional: Uncomment if using Keras directly
+# For Async (if switching later): asyncpg, greenlet, aioredis

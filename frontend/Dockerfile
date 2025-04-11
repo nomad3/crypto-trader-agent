@@ -14,9 +14,10 @@ RUN npm install
 # Copy the rest of the frontend application code
 COPY . .
 
-# Build the application (replace with your actual build command if different)
-# Ensure your build script outputs to the 'build' directory
-RUN npm run build
+# Build the application (Placeholder for MVP)
+# Instead of running npm run build (which is a placeholder), create a dummy build dir
+RUN mkdir build && \
+    echo '<!DOCTYPE html><html><head><title>Crypto Agent</title></head><body><h1>Frontend Placeholder</h1><p>Implement React application here.</p><div id="root"></div></body></html>' > build/index.html
 
 # Stage 2: Serve the static files using Nginx
 FROM nginx:1.25-alpine

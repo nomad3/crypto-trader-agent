@@ -609,10 +609,27 @@ def remove_agent_from_group(db: Session, agent_id: int) -> Dict[str, Any]:
         logging.exception(f"Error removing agent {agent_id} from group: {e}")
         return _error_response(agent_id, f"An unexpected error occurred: {str(e)}", 500)
 
+def get_group_performance_summary(db: Session, group_id: int) -> Dict[str, Any]:
+    """Retrieves an aggregated performance summary for all agents within a specific group."""
+    logging.info(f"Tool Call: get_group_performance_summary(group_id={group_id})")
+    try:
+        # Check if group exists first
+        group = crud.get_agent_group_by_id(db, group_id)
+        if not group:
+            return _error_response(group_id, f"Agent group with ID {group_id} not found.", 404)
+
+        summary = crud.get_group_performance_summary(db, group_id)
+        # Add group name to the summary for context
+        summary["group_name"] = group.name
+        return summary
+    except Exception as e:
+        logging.exception(f"Error getting performance summary for group {group_id}: {e}")
+        return _error_response(group_id, f"An unexpected error occurred: {str(e)}", 500)
+
 
 # --- Helper to get all tool definitions for Gemini ---
 
-# Update get_tool_definitions to include new group tools
+# Update get_tool_definitions to include new group performance tool
 
 def get_tool_definitions() -> List[callable]:
     """Returns a list of function objects to be used as tools."""
@@ -628,19 +645,22 @@ def get_tool_definitions() -> List[callable]:
         start_trading_agent,
         stop_trading_agent,
         delete_trading_agent,
-        assign_agent_to_group, # New
-        remove_agent_from_group, # New
-        # TODO: Add update_agent tool? (Careful with config updates via LLM)
+        assign_agent_to_group,
+        remove_agent_from_group,
+        # TODO: Add update_agent tool?
     ]
-    group_tools = [
-        create_agent_group,
+    group_read_tools = [
         get_agent_groups,
+        get_group_performance_summary, # New read tool
+    ]
+    group_modify_tools = [
+        create_agent_group,
         # TODO: Add update_agent_group, delete_agent_group tools?
     ]
 
     # Combine based on safety flag
-    read_only_tools = agent_read_tools + [get_agent_groups]
-    state_modifying_tools = agent_modify_tools + [create_agent_group]
+    read_only_tools = agent_read_tools + group_read_tools
+    state_modifying_tools = agent_modify_tools + group_modify_tools
 
     # --- Incremental Adoption ---
     ENABLE_STATE_MODIFICATION = True # Set to False initially for safety

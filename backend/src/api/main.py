@@ -31,9 +31,16 @@ from sqlalchemy.orm import Session
 from ..core import agent_manager
 # Import tools for validation models
 from ..gemini import tools
-from sqlalchemy.exc import IntegrityError # For catching DB errors
+from sqlalchemy.exc import IntegrityError
 # Import AgentGroup model
 from ..persistence.models import AgentGroup
+# Import Learning/Communication components
+from ..learning.analyzer import PerformanceAnalyzer
+from ..communication.redis_pubsub import CommunicationBus # Assuming a singleton or factory needed
+# (Note: Managing singletons like comm_bus in FastAPI needs care, e.g., lifespan events)
+
+# --- Temp Singleton for CommBus (Replace with proper lifespan management) ---
+temp_comm_bus_instance = CommunicationBus()
 
 # --- Security (Authentication Placeholder) ---
 # Example using OAuth2 Password Bearer flow. Replace with your actual auth mechanism.
@@ -413,6 +420,201 @@ async def api_update_agent(
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Database error updating agent.")
 
 
+# --- Agent Group Endpoints ---
+
+@app.post("/groups", response_model=AgentGroupResponse, status_code=status.HTTP_201_CREATED, tags=["Groups"])
+async def api_create_agent_group(
+    group_data: AgentGroupCreate,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Create a new agent group."""
+    logging.info(f"User {current_user['username']} creating agent group '{group_data.name}'")
+    try:
+        db_group = crud.create_agent_group(db, name=group_data.name, description=group_data.description)
+        return db_group # Pydantic automatically handles conversion due to orm_mode=True
+    except ValueError as e: # Handles duplicate name error from CRUD
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+    except Exception as e:
+        logging.exception(f"Database error creating agent group '{group_data.name}': {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Database error creating agent group.")
+
+@app.get("/groups", response_model=List[AgentGroupResponse], tags=["Groups"])
+async def api_list_agent_groups(
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    skip: int = 0,
+    limit: int = 100
+):
+    """List all agent groups."""
+    logging.info(f"User {current_user['username']} listing agent groups (skip={skip}, limit={limit})")
+    try:
+        groups = crud.get_agent_groups(db, skip=skip, limit=limit)
+        return groups
+    except Exception as e:
+        logging.exception(f"Database error listing agent groups: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Database error listing agent groups.")
+
+@app.get("/groups/{group_id}", response_model=AgentGroupResponse, tags=["Groups"])
+async def api_get_agent_group(
+    group_id: int,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Get details for a specific agent group."""
+    logging.info(f"User {current_user['username']} getting details for group {group_id}")
+    db_group = crud.get_agent_group_by_id(db, group_id)
+    if not db_group:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Agent group with ID {group_id} not found")
+    return db_group
+
+@app.put("/groups/{group_id}", response_model=AgentGroupResponse, tags=["Groups"])
+async def api_update_agent_group(
+    group_id: int,
+    group_update: AgentGroupUpdate,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Update an agent group's details (name, description)."""
+    logging.info(f"User {current_user['username']} updating group {group_id} with data: {group_update.dict(exclude_unset=True)}")
+    try:
+        updated_group = crud.update_agent_group(
+            db, group_id=group_id, name=group_update.name, description=group_update.description
+        )
+        if not updated_group:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Agent group with ID {group_id} not found")
+        return updated_group
+    except ValueError as e: # Handles duplicate name error from CRUD
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+    except Exception as e:
+        logging.exception(f"Database error updating agent group {group_id}: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Database error updating agent group.")
+
+@app.delete("/groups/{group_id}", status_code=status.HTTP_204_NO_CONTENT, tags=["Groups"])
+async def api_delete_agent_group(
+    group_id: int,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Delete an agent group. Fails if the group contains agents."""
+    logging.warning(f"User {current_user['username']} attempting to DELETE agent group {group_id}")
+    try:
+        deleted = crud.delete_agent_group(db, group_id)
+        if not deleted:
+            # Should be caught by CRUD check, but defensive
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Agent group with ID {group_id} not found")
+        # No content to return on successful delete
+    except ValueError as e: # Catches "group not empty" error from CRUD
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+    except Exception as e:
+        logging.exception(f"Database error deleting agent group {group_id}: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Database error deleting agent group.")
+
+
+@app.get("/groups/{group_id}/agents", response_model=List[AgentBasicInfo], tags=["Groups"])
+async def api_list_agents_in_group(
+    group_id: int,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """List all agents belonging to a specific group."""
+    logging.info(f"User {current_user['username']} listing agents for group {group_id}")
+    # Check if group exists first
+    db_group = crud.get_agent_group_by_id(db, group_id)
+    if not db_group:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Agent group with ID {group_id} not found")
+
+    try:
+        db_agents = crud.get_agents_in_group(db, group_id=group_id)
+        return [
+            AgentBasicInfo(
+                agent_id=agent.id, name=agent.name, strategy=agent.strategy_type.value,
+                status=agent.status.value, group_id=agent.group_id
+            ) for agent in db_agents
+        ]
+    except Exception as e:
+        logging.exception(f"Database error listing agents for group {group_id}: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Database error listing agents for group.")
+
+@app.get("/groups/{group_id}/performance", response_model=Dict[str, Any], tags=["Groups", "Performance"])
+async def api_get_group_performance(
+    group_id: int,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Get aggregated performance summary for a specific agent group."""
+    logging.info(f"User {current_user['username']} getting performance summary for group {group_id}")
+    # Check if group exists first
+    db_group = crud.get_agent_group_by_id(db, group_id)
+    if not db_group:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Agent group with ID {group_id} not found")
+
+    try:
+        summary = crud.get_group_performance_summary(db, group_id=group_id)
+        return summary # Return the summary dict directly
+    except Exception as e:
+        logging.exception(f"Error calculating performance summary for group {group_id}: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Error calculating group performance summary.")
+
+
+# --- Learning / Analysis Endpoints (Testing Phase) ---
+
+class AnalysisResponse(BaseModel):
+    status: str
+    analysis_summary: Optional[str] = None
+    suggestion_or_insight: Optional[Dict] = None
+    error: Optional[str] = None
+
+@app.post("/analysis/agent/{agent_id}", response_model=AnalysisResponse, tags=["Analysis (Testing)"])
+async def trigger_agent_analysis(
+    agent_id: int,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Manually trigger performance analysis for a specific agent."""
+    logging.info(f"User {current_user['username']} triggering analysis for agent {agent_id}")
+    db_agent = crud.get_agent_by_id(db, agent_id)
+    if not db_agent:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Agent with ID {agent_id} not found")
+
+    if not temp_comm_bus_instance or not temp_comm_bus_instance.is_ready():
+         # Analyze anyway, but log that suggestions won't be published
+         logging.warning(f"Comm bus not ready, analysis for agent {agent_id} will run without publishing.")
+
+    try:
+        # Instantiate analyzer with current session and comm bus
+        analyzer = PerformanceAnalyzer(db_session=db, comm_bus=temp_comm_bus_instance)
+        summary, suggestion = analyzer.analyze_agent_performance(agent_id)
+        return AnalysisResponse(status="completed", analysis_summary=summary, suggestion_or_insight=suggestion)
+    except Exception as e:
+        logging.exception(f"Error during manual analysis trigger for agent {agent_id}: {e}")
+        return AnalysisResponse(status="error", error=str(e))
+
+
+@app.post("/analysis/group/{group_id}", response_model=AnalysisResponse, tags=["Analysis (Testing)"])
+async def trigger_group_analysis(
+    group_id: int,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Manually trigger performance analysis for a specific agent group."""
+    logging.info(f"User {current_user['username']} triggering analysis for group {group_id}")
+    db_group = crud.get_agent_group_by_id(db, group_id)
+    if not db_group:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Agent group with ID {group_id} not found")
+
+    if not temp_comm_bus_instance or not temp_comm_bus_instance.is_ready():
+         logging.warning(f"Comm bus not ready, analysis for group {group_id} will run without publishing.")
+
+    try:
+        analyzer = PerformanceAnalyzer(db_session=db, comm_bus=temp_comm_bus_instance)
+        summary, insight = analyzer.analyze_group_performance(group_id)
+        return AnalysisResponse(status="completed", analysis_summary=summary, suggestion_or_insight=insight)
+    except Exception as e:
+        logging.exception(f"Error during manual analysis trigger for group {group_id}: {e}")
+        return AnalysisResponse(status="error", error=str(e))
+
+
 @app.post("/agents/{agent_id}/start", response_model=AgentActionResponse, tags=["Agents"])
 async def api_start_agent(agent_id: int, current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
     """
@@ -724,6 +926,64 @@ async def api_list_agents_in_group(
     except Exception as e:
         logging.exception(f"Database error listing agents for group {group_id}: {e}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Database error listing agents for group.")
+
+
+# --- Learning / Analysis Endpoints (Testing Phase) ---
+
+class AnalysisResponse(BaseModel):
+    status: str
+    analysis_summary: Optional[str] = None
+    suggestion_or_insight: Optional[Dict] = None
+    error: Optional[str] = None
+
+@app.post("/analysis/agent/{agent_id}", response_model=AnalysisResponse, tags=["Analysis (Testing)"])
+async def trigger_agent_analysis(
+    agent_id: int,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Manually trigger performance analysis for a specific agent."""
+    logging.info(f"User {current_user['username']} triggering analysis for agent {agent_id}")
+    db_agent = crud.get_agent_by_id(db, agent_id)
+    if not db_agent:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Agent with ID {agent_id} not found")
+
+    if not temp_comm_bus_instance or not temp_comm_bus_instance.is_ready():
+         # Analyze anyway, but log that suggestions won't be published
+         logging.warning(f"Comm bus not ready, analysis for agent {agent_id} will run without publishing.")
+
+    try:
+        # Instantiate analyzer with current session and comm bus
+        analyzer = PerformanceAnalyzer(db_session=db, comm_bus=temp_comm_bus_instance)
+        summary, suggestion = analyzer.analyze_agent_performance(agent_id)
+        return AnalysisResponse(status="completed", analysis_summary=summary, suggestion_or_insight=suggestion)
+    except Exception as e:
+        logging.exception(f"Error during manual analysis trigger for agent {agent_id}: {e}")
+        return AnalysisResponse(status="error", error=str(e))
+
+
+@app.post("/analysis/group/{group_id}", response_model=AnalysisResponse, tags=["Analysis (Testing)"])
+async def trigger_group_analysis(
+    group_id: int,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Manually trigger performance analysis for a specific agent group."""
+    logging.info(f"User {current_user['username']} triggering analysis for group {group_id}")
+    db_group = crud.get_agent_group_by_id(db, group_id)
+    if not db_group:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Agent group with ID {group_id} not found")
+
+    if not temp_comm_bus_instance or not temp_comm_bus_instance.is_ready():
+         logging.warning(f"Comm bus not ready, analysis for group {group_id} will run without publishing.")
+
+    try:
+        analyzer = PerformanceAnalyzer(db_session=db, comm_bus=temp_comm_bus_instance)
+        summary, insight = analyzer.analyze_group_performance(group_id)
+        return AnalysisResponse(status="completed", analysis_summary=summary, suggestion_or_insight=insight)
+    except Exception as e:
+        logging.exception(f"Error during manual analysis trigger for group {group_id}: {e}")
+        return AnalysisResponse(status="error", error=str(e))
 
 
 # --- Optional Gemini Interaction Endpoint ---
