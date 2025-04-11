@@ -1,6 +1,7 @@
 import logging
 import time # For agent detail consistency check
 from fastapi import FastAPI, HTTPException, Body, Query, Depends, status
+from fastapi.middleware.cors import CORSMiddleware # Import CORS Middleware
 from fastapi.security import OAuth2PasswordBearer # Example for Auth
 from pydantic import BaseModel, Field, ValidationError
 from typing import List, Dict, Any, Optional, Literal
@@ -23,8 +24,8 @@ from ..core import agent_manager
 from ..gemini import tools
 # Import Learning/Communication components
 from ..learning.analyzer import PerformanceAnalyzer
-from ..communication.redis_pubsub import CommunicationBus # Assuming a singleton or factory needed
-# (Note: Managing singletons like comm_bus in FastAPI needs care, e.g., lifespan events)
+from ..communication.redis_pubsub import CommunicationBus
+from contextlib import asynccontextmanager # For lifespan events
 
 # --- Temp Singleton for CommBus (Replace with proper lifespan management) ---
 # This should ideally be managed via FastAPI lifespan events for cleaner setup/teardown
@@ -34,8 +35,28 @@ except Exception as e:
     logging.error(f"Failed to initialize CommunicationBus singleton: {e}")
     temp_comm_bus_instance = None
 
-# --- Security (Authentication Placeholder) ---
-# Example using OAuth2 Password Bearer flow. Replace with your actual auth mechanism.
+
+# --- Lifespan Event Handler ---
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Code to run on startup
+    logging.info("Application startup: Initializing database...")
+    try:
+        # Import init_db here to avoid potential circular imports at module level
+        from ..persistence.database import init_db
+        init_db() # Create tables if they don't exist
+        logging.info("Database initialization check complete.")
+    except Exception as e:
+        logging.exception("Database initialization failed during startup!")
+        # Depending on severity, you might want to prevent startup
+    yield
+    # Code to run on shutdown (optional)
+    logging.info("Application shutdown.")
+    if temp_comm_bus_instance:
+        temp_comm_bus_instance.stop_listener() # Gracefully stop Redis listener
+
+
+# --- Security (Authentication Placeholder - Keep for reference but disable in endpoints) ---
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token") # Dummy token URL
 
 async def get_current_user(token: str = Depends(oauth2_scheme)):
@@ -196,6 +217,23 @@ app = FastAPI(
     version="0.1.0",
     # Add security scheme definitions if using OpenAPI docs with auth
     # security=[{"oauth2_scheme": []}] # Example
+    lifespan=lifespan # Register the lifespan handler
+)
+
+# --- CORS Middleware Configuration ---
+# Allow requests from the frontend development server origin
+origins = [
+    "http://localhost:3000", # React Vite dev server
+    "http://localhost",      # Sometimes needed depending on browser/setup
+    # Add other origins if needed (e.g., your deployed frontend URL)
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True, # Allow cookies if using them for auth
+    allow_methods=["*"],    # Allow all methods (GET, POST, PUT, DELETE, etc.)
+    allow_headers=["*"],    # Allow all headers
 )
 
 
@@ -210,14 +248,15 @@ app = FastAPI(
 @app.post("/agents", response_model=AgentActionResponse, status_code=status.HTTP_201_CREATED, tags=["Agents"])
 async def api_create_agent(
     agent_data: CreateAgentRequest,
-    current_user: dict = Depends(get_current_user), # Protect endpoint
+    # current_user: dict = Depends(get_current_user), # Temporarily remove auth
     db: Session = Depends(get_db) # Inject DB session
 ):
     """
-    Create a new trading agent, optionally assigning it to a group. Requires authentication.
+    Create a new trading agent, optionally assigning it to a group.
     Validates input and uses CRUD operations to save to DB.
     """
-    logging.info(f"User {current_user['username']} creating agent '{agent_data.name}', group={agent_data.group_id}")
+    # logging.info(f"User {current_user['username']} creating agent '{agent_data.name}', group={agent_data.group_id}")
+    logging.info(f"Creating agent '{agent_data.name}', group={agent_data.group_id}") # Log without user
     # --- Validation ---
     try:
         # Validate config based on strategy type (using models defined in this file now)
@@ -262,27 +301,36 @@ async def api_create_agent(
 
 @app.get("/agents", response_model=List[AgentBasicInfo], tags=["Agents"])
 async def api_list_agents(
-    current_user: dict = Depends(get_current_user), # Protect endpoint
+    # current_user: dict = Depends(get_current_user), # Temporarily remove auth
     db: Session = Depends(get_db), # Inject DB session
     skip: int = 0,
     limit: int = 100
 ):
     """
-    List all configured trading agents with pagination. Requires authentication.
+    List all configured trading agents with pagination.
     """
-    logging.info(f"User {current_user['username']} listing agents (skip={skip}, limit={limit})")
+    # logging.info(f"User {current_user['username']} listing agents (skip={skip}, limit={limit})")
+    logging.info(f"Listing agents (skip={skip}, limit={limit})") # Log without user
     try:
         db_agents = crud.get_agents(db, skip=skip, limit=limit)
-        # Map DB models to Pydantic response models including group_id
-        return [
-            AgentBasicInfo(
-                agent_id=agent.id, # Return as int
-                name=agent.name,
-                strategy=agent.strategy_type.value,
-                status=agent.status.value,
-                group_id=agent.group_id # Include group_id
-            ) for agent in db_agents
-        ]
+        response_agents = []
+        for agent in db_agents:
+            # Calculate PnL summary for each agent
+            pnl_summary = crud.calculate_agent_pnl_summary(db, agent.id)
+            response_agents.append(
+                AgentBasicInfo(
+                    agent_id=agent.id,
+                    name=agent.name,
+                    strategy=agent.strategy_type.value,
+                    status=agent.status.value,
+                    group_id=agent.group_id,
+                    # Add PnL data to the response model if needed, or handle on frontend
+                    # For now, we'll rely on the frontend mock data, but this shows where to add it
+                    # pnl_usd=pnl_summary.get("realized_pnl_total_usd"),
+                    # total_investment_usd=crud.get_agent_investment(db, agent.id) # Hypothetical function
+                )
+            )
+        return response_agents
     except Exception as e:
         logging.exception(f"Database error listing agents: {e}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Database error listing agents.")
@@ -290,12 +338,13 @@ async def api_list_agents(
 
 # Use path parameter type hint for automatic validation
 @app.get("/agents/{agent_id}", response_model=AgentDetailResponse, tags=["Agents"]) # Use specific response model
-async def api_get_agent_details(agent_id: int, current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+async def api_get_agent_details(agent_id: int, db: Session = Depends(get_db)): # Removed current_user
     """
-    Get detailed status and information for a specific agent. Requires authentication.
+    Get detailed status and information for a specific agent.
     Performs consistency check with runtime manager.
     """
-    logging.info(f"User {current_user['username']} getting details for agent {agent_id}")
+    # logging.info(f"User {current_user['username']} getting details for agent {agent_id}")
+    logging.info(f"Getting details for agent {agent_id}") # Log without user
     db_agent = crud.get_agent_by_id(db, agent_id)
     if not db_agent:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Agent with ID {agent_id} not found")
@@ -358,14 +407,15 @@ async def api_get_agent_details(agent_id: int, current_user: dict = Depends(get_
 async def api_update_agent(
     agent_id: int,
     agent_update: UpdateAgentRequest,
-    current_user: dict = Depends(get_current_user),
+    # current_user: dict = Depends(get_current_user), # Temporarily remove auth
     db: Session = Depends(get_db)
 ):
     """
-    Update an agent's details (name, config, group assignment). Requires authentication.
+    Update an agent's details (name, config, group assignment).
     Cannot change strategy type. Config updates require validation.
     """
-    logging.info(f"User {current_user['username']} updating agent {agent_id} with data: {agent_update.dict(exclude_unset=True)}")
+    # logging.info(f"User {current_user['username']} updating agent {agent_id} with data: {agent_update.dict(exclude_unset=True)}")
+    logging.info(f"Updating agent {agent_id} with data: {agent_update.dict(exclude_unset=True)}") # Log without user
     db_agent = crud.get_agent_by_id(db, agent_id)
     if not db_agent:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Agent with ID {agent_id} not found")
@@ -405,7 +455,11 @@ async def api_update_agent(
 
         # Return the updated agent details (similar to GET details)
         # Re-fetch details to ensure consistency after update
-        return await api_get_agent_details(agent_id=agent_id, current_user=current_user, db=db)
+        # Need to pass placeholder user or remove dependency from called function too
+        # For now, just return the updated_agent directly (might lack some calculated fields like uptime)
+        # A better approach would be a dedicated function/mapper for response generation
+        # return await api_get_agent_details(agent_id=agent_id, db=db) # This still needs current_user if not removed there
+        return updated_agent # Return the direct ORM object (FastAPI handles serialization)
 
     except ValueError as e: # Catch specific errors from CRUD (e.g., group not found)
          raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
@@ -415,12 +469,13 @@ async def api_update_agent(
 
 
 @app.post("/agents/{agent_id}/start", response_model=AgentActionResponse, tags=["Agents"])
-async def api_start_agent(agent_id: int, current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+async def api_start_agent(agent_id: int, db: Session = Depends(get_db)): # Removed current_user
     """
-    Start a specific trading agent. Requires authentication.
+    Start a specific trading agent.
     Uses agent_manager to start process and CRUD to update status.
     """
-    logging.info(f"User {current_user['username']} attempting to start agent {agent_id}")
+    # logging.info(f"User {current_user['username']} attempting to start agent {agent_id}")
+    logging.info(f"Attempting to start agent {agent_id}") # Log without user
     db_agent = crud.get_agent_by_id(db, agent_id)
     if not db_agent:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Agent with ID {agent_id} not found")
@@ -457,12 +512,13 @@ async def api_start_agent(agent_id: int, current_user: dict = Depends(get_curren
 
 
 @app.post("/agents/{agent_id}/stop", response_model=AgentActionResponse, tags=["Agents"])
-async def api_stop_agent(agent_id: int, current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+async def api_stop_agent(agent_id: int, db: Session = Depends(get_db)): # Removed current_user
     """
-    Stop a specific trading agent. Requires authentication.
+    Stop a specific trading agent.
     Uses agent_manager to stop process and CRUD to update status.
     """
-    logging.info(f"User {current_user['username']} attempting to stop agent {agent_id}")
+    # logging.info(f"User {current_user['username']} attempting to stop agent {agent_id}")
+    logging.info(f"Attempting to stop agent {agent_id}") # Log without user
     db_agent = crud.get_agent_by_id(db, agent_id)
     if not db_agent:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Agent with ID {agent_id} not found")
@@ -498,12 +554,13 @@ async def api_stop_agent(agent_id: int, current_user: dict = Depends(get_current
 
 
 @app.delete("/agents/{agent_id}", response_model=AgentActionResponse, tags=["Agents"])
-async def api_delete_agent(agent_id: int, current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+async def api_delete_agent(agent_id: int, db: Session = Depends(get_db)): # Removed current_user
     """
-    Delete a specific trading agent. Requires authentication.
+    Delete a specific trading agent.
     Stops the agent process first, then deletes from DB.
     """
-    logging.warning(f"User {current_user['username']} attempting to DELETE agent {agent_id}")
+    # logging.warning(f"User {current_user['username']} attempting to DELETE agent {agent_id}")
+    logging.warning(f"Attempting to DELETE agent {agent_id}") # Log without user
     db_agent = crud.get_agent_by_id(db, agent_id)
     if not db_agent:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Agent with ID {agent_id} not found")
@@ -542,13 +599,14 @@ async def api_delete_agent(agent_id: int, current_user: dict = Depends(get_curre
 async def api_get_performance(
     agent_id: int,
     time_period: Optional[Literal["1h", "6h", "24h", "7d", "all"]] = Query("24h", description="Time period for performance data"),
-    current_user: dict = Depends(get_current_user), # Protect endpoint
+    # current_user: dict = Depends(get_current_user), # Temporarily remove auth
     db: Session = Depends(get_db)
 ):
     """
-    Get detailed performance data (trades, KPIs) for a specific agent. Requires authentication.
+    Get detailed performance data (trades, KPIs) for a specific agent.
     """
-    logging.info(f"User {current_user['username']} getting performance for agent {agent_id}, period {time_period}")
+    # logging.info(f"User {current_user['username']} getting performance for agent {agent_id}, period {time_period}")
+    logging.info(f"Getting performance for agent {agent_id}, period {time_period}") # Log without user
     db_agent = crud.get_agent_by_id(db, agent_id)
     if not db_agent:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Agent with ID {agent_id} not found")
@@ -590,11 +648,12 @@ async def api_get_performance(
 
 
 @app.get("/agents/{agent_id}/pnl", response_model=PnlSummaryResponse, tags=["Performance"])
-async def api_get_pnl(agent_id: int, current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+async def api_get_pnl(agent_id: int, db: Session = Depends(get_db)): # Removed current_user
     """
-    Get the PnL summary for a specific agent. Requires authentication.
+    Get the PnL summary for a specific agent.
     """
-    logging.info(f"User {current_user['username']} getting PnL summary for agent {agent_id}")
+    # logging.info(f"User {current_user['username']} getting PnL summary for agent {agent_id}")
+    logging.info(f"Getting PnL summary for agent {agent_id}") # Log without user
     db_agent = crud.get_agent_by_id(db, agent_id)
     if not db_agent:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Agent with ID {agent_id} not found")
@@ -616,11 +675,12 @@ async def api_get_pnl(agent_id: int, current_user: dict = Depends(get_current_us
 @app.post("/groups", response_model=AgentGroupResponse, status_code=status.HTTP_201_CREATED, tags=["Groups"])
 async def api_create_agent_group(
     group_data: AgentGroupCreate,
-    current_user: dict = Depends(get_current_user),
+    # current_user: dict = Depends(get_current_user), # Temporarily remove auth
     db: Session = Depends(get_db)
 ):
     """Create a new agent group."""
-    logging.info(f"User {current_user['username']} creating agent group '{group_data.name}'")
+    # logging.info(f"User {current_user['username']} creating agent group '{group_data.name}'")
+    logging.info(f"Creating agent group '{group_data.name}'") # Log without user
     try:
         db_group = crud.create_agent_group(db, name=group_data.name, description=group_data.description)
         return db_group # Pydantic automatically handles conversion due to orm_mode=True
@@ -632,13 +692,14 @@ async def api_create_agent_group(
 
 @app.get("/groups", response_model=List[AgentGroupResponse], tags=["Groups"])
 async def api_list_agent_groups(
-    current_user: dict = Depends(get_current_user),
+    # current_user: dict = Depends(get_current_user), # Temporarily remove auth
     db: Session = Depends(get_db),
     skip: int = 0,
     limit: int = 100
 ):
     """List all agent groups."""
-    logging.info(f"User {current_user['username']} listing agent groups (skip={skip}, limit={limit})")
+    # logging.info(f"User {current_user['username']} listing agent groups (skip={skip}, limit={limit})")
+    logging.info(f"Listing agent groups (skip={skip}, limit={limit})") # Log without user
     try:
         groups = crud.get_agent_groups(db, skip=skip, limit=limit)
         return groups
@@ -649,11 +710,12 @@ async def api_list_agent_groups(
 @app.get("/groups/{group_id}", response_model=AgentGroupResponse, tags=["Groups"])
 async def api_get_agent_group(
     group_id: int,
-    current_user: dict = Depends(get_current_user),
+    # current_user: dict = Depends(get_current_user), # Temporarily remove auth
     db: Session = Depends(get_db)
 ):
     """Get details for a specific agent group."""
-    logging.info(f"User {current_user['username']} getting details for group {group_id}")
+    # logging.info(f"User {current_user['username']} getting details for group {group_id}")
+    logging.info(f"Getting details for group {group_id}") # Log without user
     db_group = crud.get_agent_group_by_id(db, group_id)
     if not db_group:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Agent group with ID {group_id} not found")
@@ -663,11 +725,12 @@ async def api_get_agent_group(
 async def api_update_agent_group(
     group_id: int,
     group_update: AgentGroupUpdate,
-    current_user: dict = Depends(get_current_user),
+    # current_user: dict = Depends(get_current_user), # Temporarily remove auth
     db: Session = Depends(get_db)
 ):
     """Update an agent group's details (name, description)."""
-    logging.info(f"User {current_user['username']} updating group {group_id} with data: {group_update.dict(exclude_unset=True)}")
+    # logging.info(f"User {current_user['username']} updating group {group_id} with data: {group_update.dict(exclude_unset=True)}")
+    logging.info(f"Updating group {group_id} with data: {group_update.dict(exclude_unset=True)}") # Log without user
     try:
         updated_group = crud.update_agent_group(
             db, group_id=group_id, name=group_update.name, description=group_update.description
@@ -684,11 +747,12 @@ async def api_update_agent_group(
 @app.delete("/groups/{group_id}", status_code=status.HTTP_204_NO_CONTENT, tags=["Groups"])
 async def api_delete_agent_group(
     group_id: int,
-    current_user: dict = Depends(get_current_user),
+    # current_user: dict = Depends(get_current_user), # Temporarily remove auth
     db: Session = Depends(get_db)
 ):
     """Delete an agent group. Fails if the group contains agents."""
-    logging.warning(f"User {current_user['username']} attempting to DELETE agent group {group_id}")
+    # logging.warning(f"User {current_user['username']} attempting to DELETE agent group {group_id}")
+    logging.warning(f"Attempting to DELETE agent group {group_id}") # Log without user
     try:
         deleted = crud.delete_agent_group(db, group_id)
         if not deleted:
@@ -705,11 +769,12 @@ async def api_delete_agent_group(
 @app.get("/groups/{group_id}/agents", response_model=List[AgentBasicInfo], tags=["Groups"])
 async def api_list_agents_in_group(
     group_id: int,
-    current_user: dict = Depends(get_current_user),
+    # current_user: dict = Depends(get_current_user), # Temporarily remove auth
     db: Session = Depends(get_db)
 ):
     """List all agents belonging to a specific group."""
-    logging.info(f"User {current_user['username']} listing agents for group {group_id}")
+    # logging.info(f"User {current_user['username']} listing agents for group {group_id}")
+    logging.info(f"Listing agents for group {group_id}") # Log without user
     # Check if group exists first
     db_group = crud.get_agent_group_by_id(db, group_id)
     if not db_group:
@@ -730,11 +795,12 @@ async def api_list_agents_in_group(
 @app.get("/groups/{group_id}/performance", response_model=Dict[str, Any], tags=["Groups", "Performance"])
 async def api_get_group_performance(
     group_id: int,
-    current_user: dict = Depends(get_current_user),
+    # current_user: dict = Depends(get_current_user), # Temporarily remove auth
     db: Session = Depends(get_db)
 ):
     """Get aggregated performance summary for a specific agent group."""
-    logging.info(f"User {current_user['username']} getting performance summary for group {group_id}")
+    # logging.info(f"User {current_user['username']} getting performance summary for group {group_id}")
+    logging.info(f"Getting performance summary for group {group_id}") # Log without user
     # Check if group exists first
     db_group = crud.get_agent_group_by_id(db, group_id)
     if not db_group:
@@ -759,11 +825,12 @@ class AnalysisResponse(BaseModel):
 @app.post("/analysis/agent/{agent_id}", response_model=AnalysisResponse, tags=["Analysis (Testing)"])
 async def trigger_agent_analysis(
     agent_id: int,
-    current_user: dict = Depends(get_current_user),
+    # current_user: dict = Depends(get_current_user), # Temporarily remove auth
     db: Session = Depends(get_db)
 ):
     """Manually trigger performance analysis for a specific agent."""
-    logging.info(f"User {current_user['username']} triggering analysis for agent {agent_id}")
+    # logging.info(f"User {current_user['username']} triggering analysis for agent {agent_id}")
+    logging.info(f"Triggering analysis for agent {agent_id}") # Log without user
     db_agent = crud.get_agent_by_id(db, agent_id)
     if not db_agent:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Agent with ID {agent_id} not found")
@@ -785,11 +852,12 @@ async def trigger_agent_analysis(
 @app.post("/analysis/group/{group_id}", response_model=AnalysisResponse, tags=["Analysis (Testing)"])
 async def trigger_group_analysis(
     group_id: int,
-    current_user: dict = Depends(get_current_user),
+    # current_user: dict = Depends(get_current_user), # Temporarily remove auth
     db: Session = Depends(get_db)
 ):
     """Manually trigger performance analysis for a specific agent group."""
-    logging.info(f"User {current_user['username']} triggering analysis for group {group_id}")
+    # logging.info(f"User {current_user['username']} triggering analysis for group {group_id}")
+    logging.info(f"Triggering analysis for group {group_id}") # Log without user
     db_group = crud.get_agent_group_by_id(db, group_id)
     if not db_group:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Agent group with ID {group_id} not found")
@@ -813,7 +881,7 @@ async def trigger_group_analysis(
 # passing the DB session. But keeping as is for now to demonstrate the original flow.
 
 @app.post("/gemini/command", response_model=GeminiResponse, tags=["Gemini"])
-async def handle_gemini_command(request: GeminiRequest, current_user: dict = Depends(get_current_user)): # Protect endpoint
+async def handle_gemini_command(request: GeminiRequest): # Removed current_user
     """
     (Optional) Endpoint to process natural language commands via the Gemini interaction layer. Requires authentication.
     **WARNING:** This endpoint allows Gemini to call tools that might modify state. Ensure `ENABLE_STATE_MODIFICATION` in `tools.py` is set appropriately.
@@ -827,7 +895,8 @@ async def handle_gemini_command(request: GeminiRequest, current_user: dict = Dep
     )
 
     # --- Original Logic (kept below, but unreachable) ---
-    logging.info(f"User {current_user['username']} sending Gemini command: '{request.prompt}'")
+    # logging.info(f"User {current_user['username']} sending Gemini command: '{request.prompt}'")
+    logging.info(f"Received Gemini command (disabled): '{request.prompt}'") # Log without user
     # TODO: Consider adding logic here or in interaction layer to map user-friendly names
     # (e.g., "my btc bot") from the prompt to the correct agent DB ID before calling tools.
 

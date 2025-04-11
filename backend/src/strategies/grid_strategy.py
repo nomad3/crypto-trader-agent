@@ -183,8 +183,32 @@ class GridStrategy(BaseStrategy):
 
                 if status == ORDER_STATUS_FILLED:
                     log.info(f"[{self.strategy_name}-{self.agent_id}] Order FILLED: {order['side']} {order['origQty']} @ {order['price']}")
-                    # Record the filled trade
-                    self._record_trade(order_status) # Pass full status dict
+
+                    # --- PnL Calculation (Simplified Example) ---
+                    trade_pnl: Optional[float] = None
+                    try:
+                        filled_qty = Decimal(order_status.get('executedQty', '0'))
+                        filled_price = Decimal(order_status.get('price', '0')) # Price level of the filled order
+                        commission = Decimal(order_status.get('commission', '0') or '0')
+                        # TODO: Handle commission asset conversion to quote asset (USD)
+
+                        if order['side'] == 'SELL' and filled_qty > 0:
+                            # Assume this SELL closes a previous BUY at the grid level below
+                            # WARNING: Highly simplified, needs proper position/cost basis tracking
+                            buy_price_level = filled_price - self.step_size
+                            # Calculate approximate PnL for this pair of trades
+                            pnl = (filled_price - buy_price_level) * filled_qty - commission # Simplified PnL
+                            trade_pnl = float(pnl)
+                            log.info(f"[{self.strategy_name}-{self.agent_id}] Calculated PnL for sell @ {filled_price}: {trade_pnl:.4f} USD (Simplified)")
+                        elif order['side'] == 'BUY':
+                             # PnL is typically realized on the closing (SELL) trade in this simple model
+                             pass
+
+                    except Exception as pnl_err:
+                         log.error(f"[{self.strategy_name}-{self.agent_id}] Error calculating PnL for order {order_id}: {pnl_err}")
+
+                    # Record the filled trade, passing the calculated PnL
+                    self._record_trade(order_status, pnl_usd=trade_pnl) # Pass full status dict and PnL
 
                     # Remove from open orders tracking
                     if order['side'] == 'BUY':

@@ -2,7 +2,8 @@ import logging
 from sqlalchemy.orm import Session
 from typing import List, Optional, Dict, Any
 from sqlalchemy.orm import Session, joinedload
-from sqlalchemy.exc import IntegrityError # For handling unique constraints
+from sqlalchemy.exc import IntegrityError
+from datetime import datetime # Import datetime
 
 from . import models
 from .models import Agent, Trade, AgentGroup, AgentStatusEnum, StrategyTypeEnum
@@ -233,10 +234,20 @@ def get_group_performance_summary(db: Session, group_id: int) -> Dict[str, Any]:
 
 # --- Trade CRUD ---
 
-def create_trade(db: Session, agent_id: int, trade_data: Dict[str, Any]) -> models.Trade:
-    """Creates a new trade record associated with an agent."""
-    # TODO: Add validation for trade_data fields
-    db_trade = models.Trade(
+def create_trade(db: Session, agent_id: int, trade_data: Dict[str, Any], pnl_usd: Optional[float] = None) -> models.Trade:
+    """
+    Creates a new trade record associated with an agent.
+    Accepts an optional pre-calculated PnL for the trade.
+    """
+    # Basic validation for essential trade data
+    required_fields = ["symbol", "orderId", "side", "price", "executedQty", "cummulativeQuoteQty"]
+    if not all(field in trade_data for field in required_fields):
+        logging.error(f"Missing required fields in trade_data for agent {agent_id}: {trade_data}")
+        raise ValueError("Missing required fields in trade_data")
+
+    # Wrap the creation in a try block to handle potential DB errors
+    try:
+        db_trade = models.Trade(
         agent_id=agent_id,
         symbol=trade_data.get("symbol"),
         order_id=trade_data.get("orderId"), # Match Binance naming
@@ -245,16 +256,28 @@ def create_trade(db: Session, agent_id: int, trade_data: Dict[str, Any]) -> mode
         price=float(trade_data.get("price", 0.0)),
         quantity=float(trade_data.get("executedQty", 0.0)),
         quote_quantity=float(trade_data.get("cummulativeQuoteQty", 0.0)),
-        commission=float(trade_data.get("commission", 0.0) or 0.0), # Handle None
+        commission=float(trade_data.get("commission", 0.0) or 0.0),
         commission_asset=trade_data.get("commissionAsset"),
-        timestamp=func.now() # Or use timestamp from trade_data if available/reliable
-        # pnl_usd needs calculation, perhaps later or via trigger/separate process
+        # Use timestamp from trade data if available and valid, otherwise use current time
+        # Binance trade timestamp is typically in milliseconds
+        timestamp=datetime.fromtimestamp(trade_data['time'] / 1000) if 'time' in trade_data else func.now(),
+        pnl_usd=pnl_usd # Assign the calculated PnL
     )
-    db.add(db_trade)
-    db.commit()
-    db.refresh(db_trade)
-    logging.debug(f"Trade recorded in DB for Agent ID {agent_id}: OrderID={db_trade.order_id}")
-    return db_trade
+        # Removed extra closing parenthesis here
+        db.add(db_trade)
+        db.commit()
+        db.refresh(db_trade)
+        logging.debug(f"Trade recorded in DB for Agent ID {agent_id}: OrderID={db_trade.order_id}")
+        return db_trade
+    except IntegrityError as e:
+        db.rollback()
+        logging.error(f"Database integrity error creating trade for agent {agent_id}: {e}")
+        # Decide if this should raise or return None/error indicator
+        raise ValueError(f"Integrity error creating trade: {e}")
+    except Exception as e:
+        db.rollback()
+        logging.exception(f"Unexpected database error creating trade for agent {agent_id}: {e}")
+        raise # Re-raise unexpected errors
 
 def get_trades_for_agent(db: Session, agent_id: int, skip: int = 0, limit: int = 1000) -> List[models.Trade]:
     """Retrieves trades for a specific agent, ordered by timestamp descending."""
@@ -268,15 +291,25 @@ def get_trades_for_agent(db: Session, agent_id: int, skip: int = 0, limit: int =
 
 # --- Performance Calculation Helpers (Placeholders) ---
 
-def calculate_agent_pnl_summary(db: Session, agent_id: int) -> Dict[str, Any]:
-    """Placeholder for calculating PnL summary from trades in DB."""
-    # This needs a proper implementation based on trade history and potentially current positions
-    trades = get_trades_for_agent(db, agent_id, limit=10000) # Get recent trades
-    realized_pnl = sum(t.pnl_usd for t in trades if t.pnl_usd is not None) # Needs pnl_usd to be calculated/stored
+from sqlalchemy import func, select, Numeric # Import func and select
+from sqlalchemy.types import Float # Import Float for casting if needed
 
-    # Placeholder values
+def calculate_agent_pnl_summary(db: Session, agent_id: int) -> Dict[str, Any]:
+    """Calculates the total realized PnL summary for an agent by summing trade PnLs."""
+    # Query the sum of pnl_usd for the given agent_id
+    # Ensure pnl_usd is treated as numeric/float for summation
+    # Use coalesce to handle cases where there are no trades or pnl_usd is NULL, returning 0.0
+    total_pnl_query = select(func.coalesce(func.sum(models.Trade.pnl_usd), 0.0))\
+        .where(models.Trade.agent_id == agent_id)\
+        .where(models.Trade.pnl_usd.isnot(None)) # Only sum non-null PnL values
+
+    total_realized_pnl = db.execute(total_pnl_query).scalar_one()
+
+    # TODO: Implement Unrealized PnL calculation (requires tracking current open positions and market price)
+    # TODO: Implement PnL for specific time periods (e.g., 24h) by filtering trades based on timestamp
+
     return {
-        "realized_pnl_total_usd": round(realized_pnl, 2),
-        "unrealized_pnl_usd": 0.0, # Requires position tracking
-        "pnl_24h_usd": 0.0 # Requires time filtering and calculation
+        "realized_pnl_total_usd": round(float(total_realized_pnl), 2), # Ensure result is float
+        "unrealized_pnl_usd": 0.0, # Placeholder - Requires position tracking
+        "pnl_24h_usd": 0.0 # Placeholder - Requires time filtering
     }

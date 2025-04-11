@@ -30,9 +30,14 @@ export const listAgents = async () => {
   }
 };
 
-export const createAgent = async (name, strategyType, config) => {
+export const createAgent = async (agentData) => {
+  // agentData should match CreateAgentRequest model: { name, strategy_type, config, group_id? }
   try {
-    const payload = { name, strategy_type: strategyType, config };
+    // Ensure group_id is null if not provided or empty string
+    const payload = {
+      ...agentData,
+      group_id: agentData.group_id || null,
+    };
     const response = await apiClient.post('/agents', payload);
     return response.data; // Expects: AgentActionResponse
   } catch (error) {
@@ -104,6 +109,31 @@ export const getAgentPnlSummary = async (agentId) => {
     throw error;
   }
 };
+
+// --- Agent Groups ---
+
+export const listGroups = async () => {
+  try {
+    const response = await apiClient.get('/groups');
+    return response.data; // Expects: List[AgentGroupResponse]
+  } catch (error) {
+    console.error("Error listing groups:", error.response?.data || error.message);
+    throw error;
+  }
+};
+
+export const createGroup = async (groupData) => {
+  // groupData: { name, description? }
+  try {
+    const response = await apiClient.post('/groups', groupData);
+    return response.data; // Expects: AgentGroupResponse
+  } catch (error) {
+    console.error("Error creating group:", error.response?.data || error.message);
+    throw error;
+  }
+};
+
+// TODO: Add updateGroup, deleteGroup, listAgentsInGroup if needed
 
 // --- Gemini Interaction ---
 

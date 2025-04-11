@@ -14,19 +14,18 @@ RUN npm install
 # Copy the rest of the frontend application code
 COPY . .
 
-# Build the application (Placeholder for MVP)
-# Instead of running npm run build (which is a placeholder), create a dummy build dir
-RUN mkdir build && \
-    echo '<!DOCTYPE html><html><head><title>Crypto Agent</title></head><body><h1>Frontend Placeholder</h1><p>Implement React application here.</p><div id="root"></div></body></html>' > build/index.html
+# Build the application using Vite
+RUN npm run build
 
 # Stage 2: Serve the static files using Nginx
 FROM nginx:1.25-alpine
 
-# Copy the build output from the build stage
+# Copy the build output from the build stage (Vite outputs to /app/dist by default if not specified otherwise in vite.config.js build.outDir)
+# Let's ensure vite.config.js uses 'build' as outDir, which it does.
 COPY --from=build /app/build /usr/share/nginx/html
 
-# Copy a custom Nginx configuration (optional, but recommended for SPAs)
-# COPY nginx.conf /etc/nginx/conf.d/default.conf # See example below
+# Copy a custom Nginx configuration to handle SPA routing
+COPY nginx.conf /etc/nginx/conf.d/default.conf
 
 # Expose port 80 for Nginx
 EXPOSE 80
