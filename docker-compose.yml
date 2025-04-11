@@ -1,0 +1,82 @@
+version: '3.8'
+
+services:
+  db:
+    image: postgres:15-alpine # Use official PostgreSQL image
+    container_name: crypto-trader-db
+    volumes:
+      - postgres_data:/var/lib/postgresql/data/ # Persist data
+    environment:
+      # These should match the DATABASE_URL components in .env
+      POSTGRES_USER: ${POSTGRES_USER:-user} # Default to 'user' if not set in .env
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-password} # Default to 'password'
+      POSTGRES_DB: ${POSTGRES_DB:-trading_db} # Default to 'trading_db'
+    ports:
+      # Expose port 5432 externally if needed for direct access (optional)
+      - "5432:5432"
+    networks:
+      - crypto-net
+    # Add healthcheck for better startup coordination
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-user} -d $${POSTGRES_DB:-trading_db}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: crypto-trader-backend
+    # Load environment variables from .env file in the backend directory
+    env_file:
+      # Use the .env file from the project root now for DB credentials
+      - ./.env
+    volumes:
+      # Mount source code for hot-reloading
+      - ./backend/src:/app/src
+      # Remove SQLite volume mount
+      # - ./backend/trading_agents.db:/app/backend/trading_agents.db
+    ports:
+      - "8000:8000"
+    # Ensure backend starts only after the database is healthy
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - crypto-net
+    # Pass database connection details via environment variables from .env
+    # The backend code (database.py) will construct the DATABASE_URL
+    environment:
+      DATABASE_URL: ${DATABASE_URL} # This will be constructed in database.py now
+      POSTGRES_HOST: db # Service name of the database container
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: ${POSTGRES_USER:-user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-password}
+      POSTGRES_DB: ${POSTGRES_DB:-trading_db}
+      # Pass other keys directly if needed, or keep using backend/.env via env_file
+      BINANCE_API_KEY: ${BINANCE_API_KEY}
+      BINANCE_SECRET_KEY: ${BINANCE_SECRET_KEY}
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: crypto-trader-frontend
+    ports:
+      # Map host port 3000 to container port 80 (Nginx default)
+      - "3000:80"
+    # Depends on backend so it can potentially proxy API calls (if nginx.conf is configured)
+    depends_on:
+      - backend
+    networks:
+      - crypto-net
+
+networks:
+  crypto-net:
+    driver: bridge
+
+# Define the named volume for PostgreSQL data
+volumes:
+  postgres_data:
